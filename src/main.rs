@@ -1,10 +1,14 @@
-use std::{env, os::unix::net::UnixStream, path::PathBuf, str::FromStr};
+use std::{env, fs, os::unix::net::UnixStream, path::PathBuf, str::FromStr};
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Context, Result};
 
 use clap::{Parser, Subcommand};
 use daemon::{RestartOption, Service};
 use protocol::Packet;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::EnvFilter;
 
 mod daemon;
 pub mod protocol;
@@ -44,9 +48,37 @@ enum Commands {
     },
 }
 
+pub fn init_logger() -> Result<WorkerGuard> {
+    let log_dir = directories::BaseDirs::new()
+        .ok_or(eyre!("couldn't init basedirs"))
+        .context("init logger error")?
+        .data_dir()
+        .join("rsm/logs");
+    fs::create_dir_all(&log_dir)?;
+    let (file_appender, guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "rsm.log"));
+
+    let collector = tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env().add_directive(tracing::Level::TRACE.into()))
+        .with(
+            tracing_subscriber::fmt::Layer::new()
+                .with_ansi(true)
+                .with_writer(std::io::stdout),
+        )
+        .with(
+            tracing_subscriber::fmt::Layer::new()
+                .with_ansi(false)
+                .with_writer(file_appender),
+        );
+
+    tracing::subscriber::set_global_default(collector)
+        .context("Unable to set a global collector")?;
+
+    Ok(guard)
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
-    tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
 

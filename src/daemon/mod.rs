@@ -1,8 +1,8 @@
 use std::{
-    fs,
+    env, fs,
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -43,7 +43,7 @@ pub struct Service {
     pub env_vars: Vec<(String, String)>,
     pub working_directory: PathBuf,
     pub restart_option: RestartOption,
-    /// default is /tmp/rsm-[NAME]-[PID].log
+    /// default is /tmp/rsm-[NAME].log
     pub log_file: Option<PathBuf>,
 }
 
@@ -65,7 +65,7 @@ enum ServiceThreadCommand {
     // TODO: kill?
 }
 
-static GLOBAL_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_THREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 struct ServiceThread {
@@ -75,6 +75,81 @@ struct ServiceThread {
     id: usize,
 }
 
+fn spawn_service(service: &Service) -> Result<Child> {
+    let log_file_path = service
+        .log_file
+        .clone()
+        .filter(|x| x.exists())
+        .unwrap_or(env::temp_dir().join(format!("rsm-{}.log", service.name)));
+
+    let out_file = fs::File::options()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(log_file_path)
+        .context("failed to open log file with write permission")?;
+
+    let process = Command::new(service.executable_path.clone())
+        .args(service.arguments.clone())
+        .envs(service.env_vars.clone())
+        .current_dir(service.working_directory.clone())
+        .stderr(out_file.try_clone()?)
+        .stdout(out_file)
+        .stdin(Stdio::null())
+        .spawn()?;
+
+    Ok(process)
+}
+
+fn service_thread(
+    sender: Sender<Result<()>>,
+    receiver: Receiver<ServiceThreadCommand>,
+    pool: Arc<Mutex<Vec<ServiceThread>>>,
+    service_mutex: Arc<Mutex<Service>>,
+    thread_id: usize,
+) -> Result<()> {
+    let mut process = {
+        let service = service_mutex.lock();
+        spawn_service(&service)?
+    };
+
+    // TODO: here we should check for receiver input and if process has exited
+    loop {
+        // Don't murder cpu
+        thread::sleep(Duration::from_millis(200));
+
+        // Restart if process has exited according to restart_option
+        if let Some(successful_exit) = process.try_wait().unwrap_or(None).map(|x| x.success()) {
+            let should_restart = match successful_exit {
+                // match {} to drop lock asap, since scope ends
+                true => match { service_mutex.lock().restart_option.clone() } {
+                    RestartOption::Always | RestartOption::UnlessStopped => true,
+                    RestartOption::OnCrash | RestartOption::Never => false,
+                },
+                false => match { service_mutex.lock().restart_option.clone() } {
+                    RestartOption::Always
+                    | RestartOption::UnlessStopped
+                    | RestartOption::OnCrash => true,
+                    RestartOption::Never => false,
+                },
+            };
+            if should_restart {
+                process = {
+                    let service = service_mutex.lock();
+                    spawn_service(&service)?
+                }
+            }
+        }
+
+        // Check for commands
+    }
+
+    // if we get to this point, thread is exiting and should be removed from pool
+    pool.lock().retain(|x| x.id != thread_id);
+
+    Ok(())
+}
+
 impl ServiceThread {
     fn add_to(pool: Arc<Mutex<Vec<ServiceThread>>>, service: Service) {
         let (command_sender, command_receiver) = mpsc::channel();
@@ -82,48 +157,30 @@ impl ServiceThread {
         let arc_mutex_service = Arc::new(Mutex::new(service));
 
         let pool = pool.clone();
+
+        let thread_id = GLOBAL_THREAD_COUNTER.fetch_add(1, Ordering::SeqCst);
+
         let pool_for_thread = pool.clone();
-
-        let id = GLOBAL_THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
-
         let service_for_thread = arc_mutex_service.clone();
 
+        let service_name = { arc_mutex_service.clone().lock().name.clone() };
+
         thread::spawn(move || {
-            let (sender, receiver) = (result_sender, command_receiver);
-            let pool = pool_for_thread;
-            let service_mutex = service_for_thread;
-
-            let process_template = {
-                let service = service_mutex.lock();
-                Command::new(service.executable_path.clone())
-                    .args(service.arguments.clone())
-                    .envs(service.env_vars.clone())
-                    .current_dir(service.working_directory.clone())
-                    .stderr(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stdin(Stdio::null())
-            };
-
-            // TODO: handle logging!
-
-            // TODO: run process
-            let process = todo!();
-
-            // TODO: here we should check for receiver input and if process has exited
-            loop {
-                thread::sleep(Duration::from_millis(1000));
-                break;
-            }
-
-            // if we get to this point, thread is exiting and should be removed from pool
-            pool.lock().retain(|x| x.id != id);
+            service_thread(
+                result_sender,
+                command_receiver,
+                pool_for_thread,
+                service_for_thread,
+                thread_id,
+            )
+            .map_err(|e| warn!("Service thread for `{}` crashed:{e:?}", service_name))
         });
 
         pool.lock().push(ServiceThread {
             service: arc_mutex_service.clone(),
             sender: command_sender,
             receiver: result_receiver,
-            id,
+            id: thread_id,
         });
     }
     fn clone_service(&self) -> Service {
@@ -150,8 +207,10 @@ fn handle_client(
 }
 
 pub fn main() -> Result<()> {
-    print!(include_str!("../../banner.ansi"));
-    info!("Starting daemon");
+    let _guard = crate::init_logger()?;
+
+    let start_log = "Starting daemon\n".to_owned() + include_str!("../../banner.ansi");
+    info!("{start_log}");
 
     // TODO: removing file doesn't crash other instances
     if crate::protocol::SOCKET_PATH.exists() {
