@@ -104,6 +104,8 @@ impl ServiceThread {
                     .stdin(Stdio::null())
             };
 
+            // TODO: handle logging!
+
             // TODO: run process
             let process = todo!();
 
