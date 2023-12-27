@@ -1,12 +1,12 @@
-use std::{env, fs, os::unix::net::UnixStream, path::PathBuf, str::FromStr};
+use std::{env, fs, path::PathBuf, str::FromStr};
 
 use color_eyre::eyre::{eyre, Context, Result};
 
 use clap::{Parser, Subcommand};
 use daemon::{RestartOption, Service};
 use protocol::Packet;
+use tokio::net::UnixStream;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
 
@@ -23,7 +23,33 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Starts the daemon
-    Daemon {},
+    Daemon {
+        /// Print debug info
+        #[cfg(debug_assertions)] // if not release, enable debug by default
+        #[arg(
+            short,
+            long,
+            default_missing_value("true"),
+            default_value("true"),
+            num_args(0..=1),
+            require_equals(true),
+            action = clap::ArgAction::Set
+        )]
+        verbose: bool,
+
+        /// Print debug info
+        #[cfg(not(debug_assertions))] // if release, disable debug by default
+        #[arg(
+            short,
+            long,
+            default_missing_value("true"),
+            default_value("false"),
+            num_args(0..=1),
+            require_equals(true),
+            action = clap::ArgAction::Set
+        )]
+        verbose: bool,
+    },
 
     /// Starts a basic service provided a /bin/sh command
     Command {
@@ -48,18 +74,32 @@ enum Commands {
     },
 }
 
-pub fn init_logger() -> Result<WorkerGuard> {
+pub fn init_logger(level: Option<tracing::Level>) -> Result<WorkerGuard> {
     let log_dir = directories::BaseDirs::new()
         .ok_or(eyre!("couldn't init basedirs"))
         .context("init logger error")?
         .data_dir()
         .join("rsm/logs");
+
     fs::create_dir_all(&log_dir)?;
+
     let (file_appender, guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "rsm.log"));
 
+    let filter = level
+        .map(|level| EnvFilter::from_default_env().add_directive(level.into()))
+        .unwrap_or({
+            #[cfg(debug_assertions)]
+            let filter = EnvFilter::from_default_env().add_directive(tracing::Level::TRACE.into());
+
+            #[cfg(not(debug_assertions))]
+            let filter = EnvFilter::from_default_env();
+
+            filter
+        });
+
     let collector = tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env().add_directive(tracing::Level::TRACE.into()))
+        .with(filter)
         .with(
             tracing_subscriber::fmt::Layer::new()
                 .with_ansi(true)
@@ -77,13 +117,20 @@ pub fn init_logger() -> Result<WorkerGuard> {
     Ok(guard)
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     color_eyre::install()?;
 
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Daemon {} => daemon::main()?,
+        Commands::Daemon { verbose } => {
+            daemon::main(match verbose {
+                true => Some(tracing::Level::DEBUG),
+                false => Some(tracing::Level::INFO),
+            })
+            .await?
+        }
         Commands::Command {
             command,
             name,
@@ -91,7 +138,7 @@ fn main() -> Result<()> {
             restart,
             log_file,
         } => {
-            let mut connection = UnixStream::connect(protocol::SOCKET_PATH.as_path())?;
+            let mut connection = UnixStream::connect(protocol::SOCKET_PATH.as_path()).await?;
             let service = Service {
                 name: name.unwrap_or(command.chars().take(12).collect()),
                 executable_path: PathBuf::from_str("/bin/sh")?,
@@ -102,7 +149,9 @@ fn main() -> Result<()> {
                 log_file,
             };
 
-            Packet::AddService(service).build_and_write(&mut connection)?;
+            Packet::AddService(service)
+                .build_and_write(&mut connection)
+                .await?;
         }
     };
 

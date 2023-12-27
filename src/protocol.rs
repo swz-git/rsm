@@ -1,12 +1,10 @@
-use std::{
-    io::{Read, Write},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
 use once_cell::sync::Lazy;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Packet {
@@ -20,29 +18,32 @@ impl Packet {
 
         let postcard_bin = to_allocvec(&self)?;
 
-        result.write_all(&(postcard_bin.len() as u16).to_be_bytes())?;
+        std::io::Write::write_all(&mut result, &(postcard_bin.len() as u16).to_be_bytes())?;
 
-        result.write_all(&postcard_bin)?;
+        std::io::Write::write_all(&mut result, &postcard_bin)?;
 
         Ok(result)
     }
 
-    pub fn build_and_write<T: Write>(&self, stream: &mut T) -> Result<()> {
+    pub async fn build_and_write<T: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        stream: &mut T,
+    ) -> Result<()> {
         let packet_bin = self.build()?;
 
-        stream.write_all(&packet_bin)?;
+        tokio::io::AsyncWriteExt::write_all(stream, &packet_bin).await?;
 
         Ok(())
     }
 
-    pub fn from_stream(stream: &mut impl Read) -> Result<Self> {
+    pub async fn from_stream<T: AsyncRead + Unpin>(stream: &mut T) -> Result<Self> {
         let mut buf = [0u8, 0u8];
 
-        stream.read_exact(&mut buf)?;
+        AsyncReadExt::read_exact(stream, &mut buf).await?;
         let len = u16::from_be_bytes(buf);
 
         let mut buf = vec![0u8; len as usize];
-        stream.read_exact(&mut buf)?;
+        AsyncReadExt::read_exact(stream, &mut buf).await?;
         let packet: Self = from_bytes(&buf)?;
 
         Ok(packet)
