@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Packet {
     AddService(crate::daemon::Service),
+    RunCommand(String, crate::daemon::ServiceThreadCommand),
     // TODO: start stop and delete
 }
 

@@ -46,6 +46,16 @@ enum Commands {
         #[arg(short, long)]
         log_file: Option<PathBuf>,
     },
+
+    Stop {
+        /// Name of process to stop
+        name: String,
+    },
+
+    Start {
+        /// Name of process to start
+        name: String,
+    },
 }
 
 pub fn init_logger() -> Result<WorkerGuard> {
@@ -114,6 +124,18 @@ async fn main() -> Result<()> {
             };
 
             Packet::AddService(service)
+                .build_and_write(&mut connection)
+                .await?;
+        }
+        Commands::Stop { name } => {
+            let mut connection = UnixStream::connect(protocol::SOCKET_PATH.as_path()).await?;
+            Packet::RunCommand(name, daemon::ServiceThreadCommand::Stop)
+                .build_and_write(&mut connection)
+                .await?;
+        }
+        Commands::Start { name } => {
+            let mut connection = UnixStream::connect(protocol::SOCKET_PATH.as_path()).await?;
+            Packet::RunCommand(name, daemon::ServiceThreadCommand::Start)
                 .build_and_write(&mut connection)
                 .await?;
         }
