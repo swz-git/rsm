@@ -227,8 +227,8 @@ async fn handle_client(
     Ok(())
 }
 
-pub async fn main(tracing_level: Option<tracing::Level>) -> Result<()> {
-    let _guard = crate::init_logger(tracing_level)?;
+pub async fn main() -> Result<()> {
+    let _guard = crate::init_logger()?;
 
     let start_log = "Starting daemon\n".to_owned() + include_str!("../../banner.ansi");
     info!("{start_log}");

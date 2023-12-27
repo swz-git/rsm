@@ -23,33 +23,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Starts the daemon
-    Daemon {
-        /// Print debug info
-        #[cfg(debug_assertions)] // if not release, enable debug by default
-        #[arg(
-            short,
-            long,
-            default_missing_value("true"),
-            default_value("true"),
-            num_args(0..=1),
-            require_equals(true),
-            action = clap::ArgAction::Set
-        )]
-        verbose: bool,
-
-        /// Print debug info
-        #[cfg(not(debug_assertions))] // if release, disable debug by default
-        #[arg(
-            short,
-            long,
-            default_missing_value("true"),
-            default_value("false"),
-            num_args(0..=1),
-            require_equals(true),
-            action = clap::ArgAction::Set
-        )]
-        verbose: bool,
-    },
+    Daemon {},
 
     /// Starts a basic service provided a /bin/sh command
     Command {
@@ -74,7 +48,7 @@ enum Commands {
     },
 }
 
-pub fn init_logger(level: Option<tracing::Level>) -> Result<WorkerGuard> {
+pub fn init_logger() -> Result<WorkerGuard> {
     let log_dir = directories::BaseDirs::new()
         .ok_or(eyre!("couldn't init basedirs"))
         .context("init logger error")?
@@ -86,17 +60,13 @@ pub fn init_logger(level: Option<tracing::Level>) -> Result<WorkerGuard> {
     let (file_appender, guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "rsm.log"));
 
-    let filter = level
-        .map(|level| EnvFilter::from_default_env().add_directive(level.into()))
-        .unwrap_or({
-            #[cfg(debug_assertions)]
-            let filter = EnvFilter::from_default_env().add_directive(tracing::Level::TRACE.into());
+    #[cfg(debug_assertions)]
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::Level::TRACE.into())
+        .from_env()?;
 
-            #[cfg(not(debug_assertions))]
-            let filter = EnvFilter::from_default_env();
-
-            filter
-        });
+    #[cfg(not(debug_assertions))]
+    let filter = EnvFilter::from_default_env();
 
     let collector = tracing_subscriber::registry()
         .with(filter)
@@ -124,13 +94,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Daemon { verbose } => {
-            daemon::main(match verbose {
-                true => Some(tracing::Level::DEBUG),
-                false => Some(tracing::Level::INFO),
-            })
-            .await?
-        }
+        Commands::Daemon {} => daemon::main().await?,
         Commands::Command {
             command,
             name,
