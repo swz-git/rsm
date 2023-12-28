@@ -1,28 +1,21 @@
-use std::{
-    env,
-    path::PathBuf,
-    process::Stdio,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{env, path::PathBuf, process::Stdio, sync::Arc};
 
 use clap::ValueEnum;
-use color_eyre::eyre::{anyhow, eyre, Context, Report, Result};
-use futures::StreamExt;
+use color_eyre::eyre::{eyre, Context, OptionExt, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     net::{UnixListener, UnixStream},
     process::{Child, Command},
-    sync::{mpsc, Mutex},
-    time::Instant,
+    sync::Mutex,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::protocol::Packet;
+
+pub mod service_threads;
+
+use service_threads::ServiceThread;
 
 #[derive(Debug, Clone, ValueEnum, Serialize, Deserialize, PartialEq)]
 #[clap(rename_all = "kebab_case")]
@@ -52,261 +45,37 @@ pub struct Service {
 }
 
 impl Service {
-    fn start(&mut self) -> Result<()> {
-        let process = Command::new(&self.executable_path)
-            .args(&self.arguments)
-            .current_dir(&self.working_directory)
-            .envs(self.env_vars.clone());
-        // spawn thread to watch quit?
-        todo!()
-    }
-}
+    async fn spawn_child(&self) -> Result<Child> {
+        let log_file_path = self
+            .log_file
+            .clone()
+            .filter(|x| x.exists())
+            .unwrap_or(env::temp_dir().join(format!("rsm-{}.log", self.name)));
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ServiceThreadCommand {
-    Start,
-    Stop,
-    Remove,
-    Status,
-    Kill,
-}
+        // tokio File doesn't implement into stdio
+        let out_file = std::fs::File::options()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(log_file_path)
+            .context("failed to open log file with write permission")?;
 
-impl ServiceThreadCommand {
-    async fn send(&self, thread: &mut ServiceThread) -> Result<ServiceState> {
-        thread
-            .sender
-            .send(self.clone())
-            .await
-            .context("couldn't send ServiceThreadCommand")?;
-        thread
-            .receiver
-            .recv()
-            .await
-            .ok_or(eyre!("channel closed"))
-            .context("ServiceThreadCommand response failed")?
-            .context("ServiceThreadCommand response failed")
-    }
-}
+        let process = Command::new(self.executable_path.clone())
+            .args(self.arguments.clone())
+            .envs(self.env_vars.clone())
+            .current_dir(self.working_directory.clone())
+            .stderr(out_file.try_clone()?)
+            .stdout(out_file)
+            .stdin(Stdio::null())
+            .spawn()?;
 
-static GLOBAL_THREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        debug!(
+            "Process for service {} started with pid: {:?}",
+            self.name,
+            process.id()
+        );
 
-#[derive(Debug, Clone)]
-struct ServiceState {
-    /// None => is_alive = false, Some => is_alive = true
-    alive_since: Option<Instant>,
-    starts: usize,
-    explicitly_stopped: bool,
-}
-
-#[derive(Debug)]
-struct ServiceThread {
-    service: Arc<Mutex<Service>>,
-    sender: mpsc::Sender<ServiceThreadCommand>,
-    receiver: mpsc::Receiver<Result<ServiceState>>,
-    id: usize,
-}
-
-async fn spawn_service(service: &Service) -> Result<Child> {
-    let log_file_path = service
-        .log_file
-        .clone()
-        .filter(|x| x.exists())
-        .unwrap_or(env::temp_dir().join(format!("rsm-{}.log", service.name)));
-
-    // tokio File doesn't implement into stdio
-    let out_file = std::fs::File::options()
-        .create(true)
-        .write(true)
-        .append(true)
-        .open(log_file_path)
-        .context("failed to open log file with write permission")?;
-
-    let process = Command::new(service.executable_path.clone())
-        .args(service.arguments.clone())
-        .envs(service.env_vars.clone())
-        .current_dir(service.working_directory.clone())
-        .stderr(out_file.try_clone()?)
-        .stdout(out_file)
-        .stdin(Stdio::null())
-        .spawn()?;
-
-    Ok(process)
-}
-
-async fn service_thread(
-    mut sender: mpsc::Sender<Result<ServiceState>>,
-    mut receiver: mpsc::Receiver<ServiceThreadCommand>,
-    pool: Arc<Mutex<Vec<ServiceThread>>>,
-    service_mutex: Arc<Mutex<Service>>,
-    thread_id: usize,
-) -> Result<()> {
-    let mut process = {
-        let service = service_mutex.lock().await;
-        spawn_service(&service).await?
-    };
-
-    let mut state = ServiceState {
-        alive_since: Some(Instant::now()),
-        starts: 1,
-        explicitly_stopped: false,
-    };
-
-    // TODO: here we should check for receiver input and if process has exited
-    loop {
-        async fn handle_restart(
-            process: &mut Child,
-            state: &mut ServiceState,
-            service_mutex: Arc<Mutex<Service>>,
-        ) -> Result<()> {
-            // Restart if process has exited according to restart_option
-            if let Some(successful_exit) = process.try_wait().unwrap_or(None).map(|x| x.success()) {
-                let restart_option = { service_mutex.lock().await.restart_option.clone() };
-                let mut should_restart = match successful_exit {
-                    // match {} to drop lock asap, since scope ends
-                    true => match restart_option {
-                        RestartOption::Always | RestartOption::UnlessStopped => true,
-                        RestartOption::OnCrash | RestartOption::Never => false,
-                    },
-                    false => match restart_option {
-                        RestartOption::Always
-                        | RestartOption::UnlessStopped
-                        | RestartOption::OnCrash => true,
-                        RestartOption::Never => false,
-                    },
-                };
-
-                if state.explicitly_stopped && restart_option != RestartOption::Always {
-                    should_restart = false
-                }
-
-                if should_restart {
-                    *state = ServiceState {
-                        alive_since: Some(Instant::now()),
-                        starts: state.starts + 1,
-                        explicitly_stopped: false,
-                    };
-
-                    *process = {
-                        let service = service_mutex.lock().await;
-                        spawn_service(&service).await?
-                    }
-                }
-            }
-
-            Ok(())
-        }
-
-        // TODO: more debug logging
-
-        tokio::select! {
-            _ = process.wait() => {
-                state.alive_since = None;
-
-                // don't restart instantly to avoid burning cpu
-                tokio::time::sleep(Duration::from_millis(500)).await;
-
-                handle_restart(&mut process, &mut state, service_mutex.clone()).await?
-            },
-            Some(msg) = receiver.recv() => {
-                match msg {
-                    ServiceThreadCommand::Start => {
-                        state.explicitly_stopped = false;
-                        if process.try_wait()?.is_some() {
-                            state.alive_since = Some(Instant::now());
-                            state.starts = state.starts + 1;
-
-                            process = {
-                                let service = service_mutex.lock().await;
-                                spawn_service(&service).await?
-                            }
-                        }
-
-                        sender.send(Ok(state.clone())).await?;
-                    },
-                    ServiceThreadCommand::Stop => {
-                        state.explicitly_stopped = true;
-                        if process.try_wait()?.is_none() {
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_millis(1000)) => {process.kill().await?}
-                                _ = process.wait() => {}
-                            }
-                        }
-                        state.alive_since = None;
-
-                        sender.send(Ok(state.clone())).await?;
-                    }
-                    ServiceThreadCommand::Remove => {
-                        state.explicitly_stopped = true;
-                        if process.try_wait()?.is_none() {
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_millis(1000)) => {process.kill().await?}
-                                _ = process.wait() => {}
-                            }
-                        }
-                        state.alive_since = None;
-
-                        sender.send(Ok(state.clone())).await?;
-                        break;
-                    }
-                    ServiceThreadCommand::Kill => {
-                        state.explicitly_stopped = true;
-                        if process.try_wait()?.is_none() {
-                            process.kill().await?
-                        }
-                        state.alive_since = None;
-
-                        sender.send(Ok(state.clone())).await?;
-                    }
-                    ServiceThreadCommand::Status => {
-                        sender.send(Ok(state.clone())).await?;
-                    }
-                }
-            }
-        }
-    }
-
-    // if we get to this point, thread is exiting and should be removed from pool
-    pool.lock().await.retain(|x| x.id != thread_id);
-
-    Ok(())
-}
-
-impl ServiceThread {
-    async fn add_to(pool: Arc<Mutex<Vec<ServiceThread>>>, service: Service) {
-        let (command_sender, command_receiver) = mpsc::channel(1);
-        let (result_sender, result_receiver) = mpsc::channel(1);
-        let arc_mutex_service = Arc::new(Mutex::new(service));
-
-        let pool = pool.clone();
-
-        let thread_id = GLOBAL_THREAD_COUNTER.fetch_add(1, Ordering::SeqCst);
-
-        let pool_for_thread = pool.clone();
-        let service_for_thread = arc_mutex_service.clone();
-
-        let service_name = { arc_mutex_service.clone().lock().await.name.clone() };
-
-        tokio::spawn(async move {
-            service_thread(
-                result_sender,
-                command_receiver,
-                pool_for_thread,
-                service_for_thread,
-                thread_id,
-            )
-            .await
-            .map_err(|e| warn!("Service thread for `{}` crashed:{e:?}", service_name))
-        });
-
-        pool.lock().await.push(ServiceThread {
-            service: arc_mutex_service.clone(),
-            sender: command_sender,
-            receiver: result_receiver,
-            id: thread_id,
-        });
-    }
-    async fn clone_service(&self) -> Service {
-        (*self.service.lock().await).clone()
+        Ok(process)
     }
 }
 
@@ -318,21 +87,33 @@ async fn handle_client(
         let Ok(packet) = Packet::from_stream(&mut stream).await else {
             break; // If parsing the packet failed, client has probably disconnected
         };
-        // TODO: more packets, stop, start, remove etc
+
         match packet {
             Packet::AddService(service) => {
                 let exists_already = {
-                    futures::stream::iter(service_threads.clone().lock().await.iter())
-                        .any(|x| async { x.clone_service().await.name == service.name })
-                        .await
+                    let mut exists = false;
+                    for thread in service_threads.clone().lock().await.iter() {
+                        if thread.clone_service().await.name == service.name {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    exists
                 };
                 if exists_already {
-                    todo!("handle already exists")
+                    Packet::AddServiceResponse(Err(
+                        "service with that name already exists".to_owned()
+                    ))
+                    .build_and_write(&mut stream)
+                    .await?;
                 } else {
                     ServiceThread::add_to(service_threads.clone(), service).await;
+                    Packet::AddServiceResponse(Ok(()))
+                        .build_and_write(&mut stream)
+                        .await?;
                 }
             }
-            Packet::RunCommand(service_name, command) => {
+            Packet::RunCommand(service_name, command) => 'scope: {
                 let mut locked = service_threads.lock().await;
                 let mut maybe_thread = None;
                 for thread in locked.iter_mut() {
@@ -342,10 +123,46 @@ async fn handle_client(
                 }
 
                 let Some(thread) = maybe_thread else {
-                    todo!("handle already exists")
+                    Packet::RunCommandResponse(Err("couldn't find service".to_owned()))
+                        .build_and_write(&mut stream)
+                        .await?;
+                    break 'scope;
                 };
 
-                command.send(thread).await?;
+                let response = command.send(thread).await?;
+
+                Packet::RunCommandResponse(Ok(response))
+                    .build_and_write(&mut stream)
+                    .await?;
+            }
+            Packet::ServicesInfo() => {
+                let mut services_info = vec![];
+
+                let mut locked = service_threads.lock().await;
+
+                for thread in locked.iter_mut() {
+                    thread
+                        .sender
+                        .send(service_threads::ServiceThreadCommand::Status)
+                        .await?;
+                    services_info.push((
+                        thread.clone_service().await,
+                        thread
+                            .receiver
+                            .recv()
+                            .await
+                            .ok_or_eyre("couldn't read status for service")?,
+                    ))
+                }
+
+                Packet::ServicesInfoResponse(Ok(services_info))
+                    .build_and_write(&mut stream)
+                    .await?;
+            }
+            Packet::RunCommandResponse(..)
+            | Packet::AddServiceResponse(..)
+            | Packet::ServicesInfoResponse(..) => {
+                Err(eyre!("wrong way, daemon received response"))?
             }
         }
     }

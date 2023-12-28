@@ -6,11 +6,19 @@ use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::daemon::{
+    service_threads::{ServiceState, ServiceThreadCommand},
+    Service,
+};
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Packet {
     AddService(crate::daemon::Service),
-    RunCommand(String, crate::daemon::ServiceThreadCommand),
-    // TODO: start stop and delete
+    AddServiceResponse(Result<(), String>),
+    RunCommand(String, ServiceThreadCommand),
+    RunCommandResponse(Result<ServiceState, String>),
+    ServicesInfo(),
+    ServicesInfoResponse(Result<Vec<(Service, ServiceState)>, String>),
 }
 
 impl Packet {

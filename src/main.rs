@@ -1,14 +1,20 @@
+use std::time::SystemTime;
 use std::{env, fs, path::PathBuf, str::FromStr};
 
-use color_eyre::eyre::{eyre, Context, Result};
+use color_eyre::eyre::{eyre, Context, Report, Result};
 
 use clap::{Parser, Subcommand};
+use daemon::service_threads::ServiceState;
 use daemon::{RestartOption, Service};
+use humantime::format_duration;
 use protocol::Packet;
+use tabled::{Table, Tabled};
 use tokio::net::UnixStream;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
+
+use crate::daemon::service_threads::ServiceThreadCommand;
 
 mod daemon;
 pub mod protocol;
@@ -46,6 +52,8 @@ enum Commands {
         #[arg(short, long)]
         log_file: Option<PathBuf>,
     },
+
+    Status {}, // TODO: add service specific status?
 
     Stop {
         /// Name of process to stop
@@ -97,6 +105,21 @@ pub fn init_logger() -> Result<WorkerGuard> {
     Ok(guard)
 }
 
+async fn run_command_wrapper(
+    stream: &mut UnixStream,
+    (name, command): (String, ServiceThreadCommand),
+) -> Result<Result<ServiceState, String>> {
+    Packet::RunCommand(name, command)
+        .build_and_write(stream)
+        .await?;
+
+    let Ok(Packet::RunCommandResponse(response)) = Packet::from_stream(stream).await else {
+        return Err(eyre!("failed reading response packet"));
+    };
+
+    Ok(response)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -126,18 +149,87 @@ async fn main() -> Result<()> {
             Packet::AddService(service)
                 .build_and_write(&mut connection)
                 .await?;
+
+            let Ok(Packet::AddServiceResponse(response)) =
+                Packet::from_stream(&mut connection).await
+            else {
+                return Err(eyre!("failed reading response packet"));
+            };
+
+            response.map_err(|err| Report::msg(err))?;
+            println!("Successfully added service");
+        }
+        Commands::Status {} => {
+            let mut connection = UnixStream::connect(protocol::SOCKET_PATH.as_path()).await?;
+
+            Packet::ServicesInfo()
+                .build_and_write(&mut connection)
+                .await?;
+
+            let Ok(Packet::ServicesInfoResponse(response)) =
+                Packet::from_stream(&mut connection).await
+            else {
+                return Err(eyre!("failed reading response packet"));
+            };
+
+            let service_info = match response {
+                Ok(x) => x,
+                Err(e) => Err(eyre!(e)).context("couldn't get services_info")?,
+            };
+
+            #[derive(Tabled)]
+            struct ServiceColumn {
+                name: String,
+                executable: String,
+                restarts: String,
+                alive_for: String,
+                starts: usize,
+                stopped: bool,
+            }
+
+            let table_data: Vec<_> = service_info
+                .iter()
+                .map(|(service, state)| ServiceColumn {
+                    name: service.name.clone(),
+                    executable: service.executable_path.to_str().unwrap().to_owned(),
+                    restarts: format!("{:?}", service.restart_option),
+                    alive_for: state
+                        .alive_since
+                        .map(|x| {
+                            format_duration(SystemTime::now().duration_since(x).unwrap())
+                                .to_string()
+                        })
+                        .unwrap_or("dead".to_owned()),
+                    starts: state.starts,
+                    stopped: state.explicitly_stopped,
+                })
+                .collect();
+
+            let mut table = Table::new(&table_data);
+            table.with(tabled::settings::Style::rounded());
+            println!("{}", table.to_string())
         }
         Commands::Stop { name } => {
             let mut connection = UnixStream::connect(protocol::SOCKET_PATH.as_path()).await?;
-            Packet::RunCommand(name, daemon::ServiceThreadCommand::Stop)
-                .build_and_write(&mut connection)
-                .await?;
+            let response: Result<ServiceState> =
+                run_command_wrapper(&mut connection, (name, ServiceThreadCommand::Stop))
+                    .await?
+                    .map_err(|err| color_eyre::eyre::Error::msg(err));
+
+            let state = response.context("command failed")?;
+
+            println!("{:?}", state);
         }
         Commands::Start { name } => {
             let mut connection = UnixStream::connect(protocol::SOCKET_PATH.as_path()).await?;
-            Packet::RunCommand(name, daemon::ServiceThreadCommand::Start)
-                .build_and_write(&mut connection)
-                .await?;
+            let response: Result<ServiceState> =
+                run_command_wrapper(&mut connection, (name, ServiceThreadCommand::Start))
+                    .await?
+                    .map_err(|err| color_eyre::eyre::Error::msg(err));
+
+            let state = response.context("command failed")?;
+
+            println!("{:?}", state);
         }
     };
 
