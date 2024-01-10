@@ -11,7 +11,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::protocol::Packet;
+use crate::{protocol::Packet, APP_FILES_DIR};
 
 pub mod service_threads;
 
@@ -85,7 +85,8 @@ async fn handle_client(
 ) -> Result<()> {
     loop {
         let Ok(packet) = Packet::from_stream(&mut stream).await else {
-            break; // If parsing the packet failed, client has probably disconnected
+            debug!("Reading packet failed, client probably disconnected");
+            break;
         };
 
         match packet {
@@ -169,6 +170,35 @@ async fn handle_client(
     Ok(())
 }
 
+// TODO: Make backwards compatible
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ServicesSaveData(Vec<u8>);
+
+impl ServicesSaveData {
+    async fn from_service_threads(service_threads: Arc<Mutex<Vec<ServiceThread>>>) -> Result<Self> {
+        let mut cloned_service_list: Vec<Service> = vec![];
+
+        for service_thread in service_threads.lock().await.iter() {
+            cloned_service_list.push(service_thread.clone_service().await)
+        }
+
+        Ok(Self(postcard::to_allocvec(&cloned_service_list)?))
+    }
+    async fn to_services(&self) -> Result<Vec<Service>> {
+        Ok(postcard::from_bytes(&self.0)?)
+    }
+    async fn save_to_default_loc(&self) -> Result<()> {
+        let filepath = APP_FILES_DIR.join("services-save-data.bin");
+        tokio::fs::write(filepath, &self.0).await?;
+        Ok(())
+    }
+    async fn read_from_default_loc() -> Result<Self> {
+        let filepath = APP_FILES_DIR.join("services-save-data.bin");
+        let data = tokio::fs::read(filepath).await?;
+        Ok(Self(data))
+    }
+}
+
 pub async fn main() -> Result<()> {
     let _guard = crate::init_logger()?;
 
@@ -188,9 +218,14 @@ pub async fn main() -> Result<()> {
 
     info!("Listening...");
 
-    // TODO: save services to disk on update and recover on startup
-
     let service_threads: Arc<Mutex<Vec<ServiceThread>>> = Arc::new(Mutex::new(vec![]));
+
+    if let Ok(restored_services_data) = ServicesSaveData::read_from_default_loc().await {
+        info!("Restoring old services");
+        for service in restored_services_data.to_services().await? {
+            ServiceThread::add_to(service_threads.clone(), service).await;
+        }
+    }
 
     for i in 0.. {
         tokio::select! {
@@ -203,9 +238,10 @@ pub async fn main() -> Result<()> {
 
                         // Spawn a new thread to handle the client
                         tokio::spawn(async move {
-                            match handle_client(stream, clone).await {
+                            match handle_client(stream, clone.clone()).await {
                                 Ok(_) => {
-                                    debug!("Connection thread {i} exited")
+                                    ServicesSaveData::from_service_threads(clone.clone()).await.context("converting to bin failed").unwrap().save_to_default_loc().await.context("saving services failed").unwrap();
+                                    debug!("Connection thread {i} exited, saved services")
                                 }
                                 Err(e) => {
                                     warn!("Thread {i} crashed:{e:?}");
@@ -219,8 +255,11 @@ pub async fn main() -> Result<()> {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Received exit signal, quitting");
-                // TODO: more stuff should happen here
+                info!("Received exit signal");
+                info!("Saving services list");
+                ServicesSaveData::from_service_threads(service_threads.clone()).await?.save_to_default_loc().await?;
+                // TODO: Graceful shutdown of services
+                info!("Bye!");
                 break
             }
         }

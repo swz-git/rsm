@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use daemon::service_threads::ServiceState;
 use daemon::{RestartOption, Service};
 use humantime::format_duration;
+use once_cell::sync::Lazy;
 use protocol::Packet;
 use tabled::{Table, Tabled};
 use tokio::net::UnixStream;
@@ -53,25 +54,44 @@ enum Commands {
         log_file: Option<PathBuf>,
     },
 
+    /// Get status of all services
     Status {}, // TODO: add service specific status?
 
+    /// Stop a running service
     Stop {
-        /// Name of process to stop
+        /// Name of service to stop
         name: String,
     },
 
+    /// Start a stopped service
     Start {
-        /// Name of process to start
+        /// Name of service to start
         name: String,
     },
+
+    /// Remove a service
+    Remove {
+        /// Name of service to remove
+        name: String,
+    },
+    // TODO: Toml file load and kill
 }
 
-pub fn init_logger() -> Result<WorkerGuard> {
-    let log_dir = directories::BaseDirs::new()
+pub static APP_FILES_DIR: Lazy<PathBuf> = Lazy::new(|| {
+    let dir = directories::BaseDirs::new()
         .ok_or(eyre!("couldn't init basedirs"))
-        .context("init logger error")?
+        .context("init logger error")
+        .unwrap()
         .data_dir()
-        .join("rsm/logs");
+        .join("rsm");
+    fs::create_dir_all(&dir)
+        .context("creating app files dir failed")
+        .unwrap();
+    dir
+});
+
+pub fn init_logger() -> Result<WorkerGuard> {
+    let log_dir = APP_FILES_DIR.join("logs");
 
     fs::create_dir_all(&log_dir)?;
 
@@ -183,6 +203,7 @@ async fn main() -> Result<()> {
                 executable: String,
                 restarts: String,
                 alive_for: String,
+                pid: String,
                 starts: usize,
                 stopped: bool,
             }
@@ -200,6 +221,10 @@ async fn main() -> Result<()> {
                                 .to_string()
                         })
                         .unwrap_or("dead".to_owned()),
+                    pid: match state.pid {
+                        Some(x) => x.to_string(),
+                        None => "None".to_owned(),
+                    },
                     starts: state.starts,
                     stopped: state.explicitly_stopped,
                 })
@@ -230,6 +255,19 @@ async fn main() -> Result<()> {
             let state = response.context("command failed")?;
 
             println!("{:?}", state);
+        }
+        Commands::Remove { name } => {
+            let mut connection = UnixStream::connect(protocol::SOCKET_PATH.as_path()).await?;
+            let response: Result<ServiceState> = run_command_wrapper(
+                &mut connection,
+                (name.clone(), ServiceThreadCommand::Remove),
+            )
+            .await?
+            .map_err(|err| color_eyre::eyre::Error::msg(err));
+
+            response?;
+
+            println!("Removed service `{}`", name);
         }
     };
 

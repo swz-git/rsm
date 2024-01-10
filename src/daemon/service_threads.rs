@@ -50,6 +50,7 @@ static GLOBAL_THREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub struct ServiceState {
     /// None => is_alive = false, Some => is_alive = true
     pub alive_since: Option<SystemTime>,
+    pub pid: Option<u32>,
     pub starts: usize,
     pub explicitly_stopped: bool,
 }
@@ -78,10 +79,10 @@ async fn service_thread(
         alive_since: Some(SystemTime::now()),
         starts: 1,
         explicitly_stopped: false,
+        pid: process.id(),
     };
 
-    // TODO: here we should check for receiver input and if process has exited
-    loop {
+    'top: loop {
         async fn handle_restart(
             process: &mut Child,
             state: &mut ServiceState,
@@ -119,16 +120,16 @@ async fn service_thread(
 
                 if should_restart {
                     debug!("Restarting process for service {}", &service_name);
+                    *process = {
+                        let service = service_mutex.lock().await;
+                        service.spawn_child().await?
+                    };
                     *state = ServiceState {
                         alive_since: Some(SystemTime::now()),
                         starts: state.starts + 1,
                         explicitly_stopped: false,
+                        pid: process.id(),
                     };
-
-                    *process = {
-                        let service = service_mutex.lock().await;
-                        service.spawn_child().await?
-                    }
                 }
             }
 
@@ -173,6 +174,7 @@ async fn service_thread(
                             }
                         }
                         state.alive_since = None;
+                        state.pid = None;
 
                         sender.send(state.clone()).await?;
                     }
@@ -187,9 +189,10 @@ async fn service_thread(
                             }
                         }
                         state.alive_since = None;
+                        state.pid = None;
 
                         sender.send(state.clone()).await?;
-                        break;
+                        break 'top;
                     }
                     ServiceThreadCommand::Kill => {
                         state.explicitly_stopped = true;
@@ -197,6 +200,7 @@ async fn service_thread(
                             process.kill().await?
                         }
                         state.alive_since = None;
+                        state.pid = None;
 
                         sender.send(state.clone()).await?;
                     }
